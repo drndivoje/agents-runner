@@ -1,0 +1,312 @@
+#!/usr/bin/env bash
+# Host wrapper: run one repo agent in a fresh, firewalled container.
+#
+# Usage: bin/agent <repo> <agent>
+#        bin/agent [repo]                (list repos / agents)
+#
+#   agents/<repo>/repo.env             optional, shared by all agents of the repo (REPO=owner/name)
+#   agents/<repo>/allowlist.txt        optional, extra firewall domains for this repo's agents
+#   CACHE_DIRS= in repo.env/agent.env  optional, container paths kept between runs (one named
+#                                      volume per path and repo/agent), e.g. ~/.gradle/caches
+#   agents/<repo>/<agent>/agent.env    config for the agent <agent> defined in the target repo's
+#                                      .claude/agents/
+#   agents/<repo>/<agent>/.env         optional, this agent's secrets (KEY=VALUE, chmod 600,
+#                                      gitignored), for its pre.sh/post.sh only
+#   agents/<repo>/<agent>/pre.sh, check.sh, post.sh (+ files they need)   optional hooks
+#
+#   bin/agent myrepo my-agent
+#     → agents/myrepo/my-agent/agent.env, claude --agent my-agent,
+#       logs in logs/myrepo/my-agent/
+#
+# Each repo/agent pair has its own lock, logs, cache volumes and secrets:
+#   secrets/.env                  CLAUDE_CODE_OAUTH_TOKEN, the only global secret (claude only)
+#   agents/<repo>/<agent>/.env    agent secrets (e.g. MY_SERVICE_TOKEN), pre.sh/post.sh only
+# Both chmod 600, parsed (never sourced). Both go into the container on stdin (never env or
+# argv, so not in `ps` or /proc/*/environ); run-agent.sh hands each only to its consumer.
+# Only agents/<repo>/ is mounted, and every .env in it is masked (/dev/null), so the
+# model can't read secret files.
+#
+# Image: IMAGE= in repo.env/agent.env (later wins) is the BASE image with the project's toolchain
+#        (e.g. eclipse-temurin:25-jdk-noble, node:22-bookworm). bin/agent builds docker/Dockerfile
+#        on top of it as agent-img:<base> when that image is missing or docker/ changed (label
+#        agents-runner.build = hash of the build files). No IMAGE= → agent-img (Dockerfile default).
+#        The container user `agent` gets your UID/GID (`id -u`/`id -g`) so files in logs/ stay
+#        yours; as root it falls back to 1000 (the container user is never root).
+# Overrides: AGENT_IMAGE (a ready-built image, used as-is, never built), AGENT_REBUILD=1
+#            (rebuild with --no-cache --pull, e.g. to update Claude Code), SECRETS_FILE, AGENTS_DIR, LOGS_DIR,
+#            AGENT_LOCK_DIR, AGENT_MEMORY, AGENT_CPUS
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly ROOT
+readonly SECRETS_FILE="${SECRETS_FILE:-$ROOT/secrets/.env}"
+readonly AGENTS_DIR="${AGENTS_DIR:-$ROOT/agents}"
+readonly LOGS_DIR="${LOGS_DIR:-$ROOT/logs}"
+# Fixed location (not $XDG_RUNTIME_DIR, which cron lacks) so manual and cron runs share the lock.
+readonly LOCK_DIR="${AGENT_LOCK_DIR:-$ROOT/.locks}"
+readonly CONTAINER_HOME=/opt/agents-runner
+readonly NAME_RE='^[a-z0-9][a-z0-9-]*$'
+readonly IMAGE_RE='^[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9._-]+)?$'
+readonly DOCKER_DIR="$ROOT/docker"
+readonly CACHE_DIR_RE='^/home/agent/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$'
+# Container user = host user, so logs/ written by the container is owned by you. Never 0.
+AGENT_UID=$(id -u); AGENT_GID=$(id -g)
+[[ "$AGENT_UID" == 0 ]] && AGENT_UID=1000
+[[ "$AGENT_GID" == 0 ]] && AGENT_GID=1000
+readonly AGENT_UID AGENT_GID
+IMAGE=""
+BASE_IMAGE=""
+CACHE_MOUNTS=()
+
+# die <message>: print "agent: <message>" to stderr and exit 1.
+die() { echo "agent: $*" >&2; exit 1; }
+
+# usage [repo]: print usage and the available repos/agents (only that repo's if given), exit 2.
+usage() {
+  {
+    echo "usage: bin/agent <repo> <agent>"
+    echo
+    echo "Available (repo: agents):"
+    list_agents "${1:-}"
+  } >&2
+  exit 2
+}
+
+# list_agents [repo]: one line per repo with its agents (folders holding an agent.env).
+list_agents() {
+  local only=$1 dir repo env agents
+  for dir in "$AGENTS_DIR"/*/; do
+    repo=$(basename "$dir")
+    [[ -z "$only" || "$only" == "$repo" ]] || continue
+    agents=""
+    for env in "$dir"*/agent.env; do
+      [[ -f "$env" ]] && agents+=" $(basename "$(dirname "$env")")"
+    done
+    printf '  %-14s%s\n' "$repo:" "${agents:- (none)}"
+  done
+}
+
+# env_value <key> <file>...: value of KEY=VALUE across files (later files win,
+# surrounding quotes stripped). Parsed, never sourced, so the files can't
+# execute code on the host.
+env_value() {
+  local key=$1 file line val=""
+  shift
+  for file in "$@"; do
+    [[ -f "$file" ]] || continue
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ "$line" == "$key="* ]] && val=${line#*=}
+    done < "$file"
+  done
+  val=${val#[\"\']}; val=${val%[\"\']}
+  printf '%s' "$val"
+}
+
+# check_configs <repo> <agent> <file>...: die if a config file contains what looks like a token
+# (GitHub or Claude, the common ones; this only detects them, the runner never uses GitHub).
+# Never prints a value.
+check_configs() {
+  local repo=$1 agent=$2 file
+  shift 2
+  for file in "$@"; do
+    [[ -f "$file" ]] || continue
+    if grep -qE '(github_pat_|ghp_|gho_|sk-ant-)[A-Za-z0-9_-]{10,}' "$file"; then
+      die "$file contains what looks like a token; move it to agents/$repo/$agent/.env (or secrets/.env for the Claude token)"
+    fi
+  done
+}
+
+# check_not_committed <file>: a secrets file inside the repo must be gitignored and untracked.
+check_not_committed() {
+  [[ "$(realpath "$1")" == "$ROOT"/* ]] || return 0
+  git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+  if git -C "$ROOT" ls-files --error-unmatch -- "$1" >/dev/null 2>&1; then
+    die "$1 is tracked by git: git rm --cached it and rotate the tokens in it"
+  fi
+  git -C "$ROOT" check-ignore -q -- "$1" || die "$1 is not gitignored (add it to .gitignore)"
+}
+
+# check_mode <file>: secrets files must be private.
+check_mode() {
+  [[ "$(stat -c %a "$1")" == 600 ]] || die "$1 must be chmod 600"
+}
+
+# hook_secrets <file>: the agent's optional secrets (agents/<repo>/<agent>/.env) as KEY=VALUE
+# lines (quotes stripped, comments and blank lines dropped). Empty if the file doesn't exist.
+hook_secrets() {
+  local file=$1 line key val
+  [[ -f "$file" ]] || return 0
+  check_mode "$file"
+  check_not_committed "$file"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+    [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || die "$file: expected KEY=VALUE lines"
+    key=${BASH_REMATCH[1]} val=${BASH_REMATCH[2]}
+    [[ "$key" == CLAUDE_CODE_OAUTH_TOKEN || "$key" == ANTHROPIC_* ]] \
+      && die "$file: $key belongs in secrets/.env, not in the agent's .env"
+    val=${val#[\"\']}; val=${val%[\"\']}
+    printf '%s=%s\n' "$key" "$val"
+  done < "$file"
+}
+
+# claude_token: CLAUDE_CODE_OAUTH_TOKEN from secrets/.env; dies if missing or empty.
+claude_token() {
+  local file=$SECRETS_FILE val
+  [[ -f "$file" ]] || die "missing $file (see secrets/.env.example)"
+  check_mode "$file"
+  val=$(env_value CLAUDE_CODE_OAUTH_TOKEN "$file")
+  [[ -n "$val" ]] || die "CLAUDE_CODE_OAUTH_TOKEN is empty in $file"
+  printf '%s' "$val"
+}
+
+# main <repo> <agent>: validate config and secrets, take the per-agent lock, build the image if
+# needed, run the container and log start/end to agent.log. Returns the container's exit code.
+main() {
+  [[ $# -eq 2 ]] || usage "${1:-}"
+  local repo=$1 agent=$2
+  [[ "$repo" =~ $NAME_RE ]] || die "invalid repo name: $repo"
+  [[ "$agent" =~ $NAME_RE ]] || die "invalid agent name: $agent"
+  [[ -d "$AGENTS_DIR/$repo" ]] || { echo "agent: unknown repo: $repo" >&2; usage; }
+  local configs=("$AGENTS_DIR/$repo/repo.env" "$AGENTS_DIR/$repo/$agent/agent.env")
+  [[ -f "${configs[1]}" ]] || { echo "agent: no agent '$agent' for $repo (missing ${configs[1]})" >&2; usage "$repo"; }
+  select_image "$(env_value IMAGE "${configs[@]}")"
+  cache_mounts "$repo.$agent" "$(env_value CACHE_DIRS "${configs[@]}")"
+  check_configs "$repo" "$agent" "$AGENTS_DIR/$repo"/* "$AGENTS_DIR/$repo/$agent"/*
+
+  local claude_token secrets
+  claude_token=$(claude_token)
+  secrets=$(hook_secrets "$AGENTS_DIR/$repo/$agent/.env")
+
+  # Flat id for lock, container and volume names.
+  local id="$repo.$agent"
+  local agent_log="$LOGS_DIR/$repo/$agent/agent.log"
+  mkdir -p "$LOCK_DIR" "$(dirname "$agent_log")"
+  exec 9>"$LOCK_DIR/$id.lock"
+  if ! flock -n 9; then
+    log_line "$agent_log" "$repo/$agent is already running, skipping"
+    exit 0
+  fi
+
+  log_line "$agent_log" "=== start $repo/$agent (image $IMAGE, agent secrets: $(secret_names "$secrets"))"
+  if [[ -z "${AGENT_IMAGE:-}" ]] && ! ensure_image 2>&1 | tee -a "$agent_log"; then
+    log_line "$agent_log" "=== end $repo/$agent exit=1 (image build failed)"
+    exit 1
+  fi
+  local rc
+  set +e
+  run_container "$id" "$repo" "$agent" "$claude_token" "$secrets" 2>&1 | tee -a "$agent_log"
+  rc=${PIPESTATUS[0]}
+  set -e
+  log_line "$agent_log" "=== end $repo/$agent exit=$rc"
+  return "$rc"
+}
+
+# secret_names <KEY=VALUE lines> → "A, B" or "none" (names only, for the log).
+secret_names() {
+  local names
+  names=$(sed -n 's/=.*//p' <<<"$1" | paste -sd, - | sed 's/,/, /g')
+  printf '%s' "${names:-none}"
+}
+
+# log_line <file> <message>: to stderr and appended to the agent's persistent log.
+log_line() {
+  printf '%s agent: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" | tee -a "$1" >&2
+}
+
+# select_image <IMAGE= from the configs>: sets IMAGE (what runs) and BASE_IMAGE (what it is built on).
+select_image() {
+  if [[ -n "${AGENT_IMAGE:-}" ]]; then
+    IMAGE=$AGENT_IMAGE
+    [[ "$IMAGE" =~ $IMAGE_RE ]] || die "invalid AGENT_IMAGE: $IMAGE"
+    docker image inspect "$IMAGE" >/dev/null 2>&1 || die "AGENT_IMAGE $IMAGE not found"
+    return
+  fi
+  BASE_IMAGE=$1
+  [[ -z "$BASE_IMAGE" || "$BASE_IMAGE" =~ $IMAGE_RE ]] || die "invalid IMAGE: $BASE_IMAGE"
+  if [[ -z "$BASE_IMAGE" ]]; then
+    IMAGE="agent-img"
+  else
+    # eclipse-temurin:25-jdk-noble → agent-img:eclipse-temurin-25-jdk-noble
+    local tag=${BASE_IMAGE//[\/:]/-}
+    IMAGE="agent-img:${tag:0:128}"
+  fi
+}
+
+# build_hash: changes whenever a file the Dockerfile uses changes (or the base image name, or UID/GID).
+build_hash() {
+  { printf '%s\n' "$BASE_IMAGE" "$AGENT_UID:$AGENT_GID"
+    cat "$DOCKER_DIR"/{Dockerfile,allowlist.txt,entrypoint.sh,init-firewall.sh}
+  } | sha256sum | cut -c1-16
+}
+
+# ensure_image: build IMAGE from docker/ on BASE_IMAGE unless an up-to-date one exists.
+# Runs under the agent lock. AGENT_REBUILD=1 forces a fresh build (new Claude Code, base updates).
+ensure_image() {
+  local hash have args=()
+  hash=$(build_hash)
+  have=$(docker image inspect -f '{{index .Config.Labels "agents-runner.build"}}' "$IMAGE" 2>/dev/null || true)
+  [[ "$have" == "<no value>" ]] && have=""
+  [[ "$have" == "$hash" && "${AGENT_REBUILD:-}" != 1 ]] && return 0
+  local why="not built by bin/agent yet"
+  [[ -n "$have" ]] && why="docker/ or UID/GID changed"
+  [[ "${AGENT_REBUILD:-}" == 1 ]] && { why="AGENT_REBUILD=1"; args+=(--no-cache --pull); }
+  printf '%s agent: building %s on %s (%s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    "$IMAGE" "${BASE_IMAGE:-the Dockerfile default}" "$why"
+  args+=(--label "agents-runner.build=$hash" -t "$IMAGE"
+         --build-arg "AGENT_UID=$AGENT_UID" --build-arg "AGENT_GID=$AGENT_GID")
+  [[ -n "$BASE_IMAGE" ]] && args+=(--build-arg "BASE_IMAGE=$BASE_IMAGE")
+  docker build "${args[@]}" "$DOCKER_DIR"
+}
+
+# cache_mounts <id> <space-separated dirs>: one named volume per dir, kept between runs of
+# this repo/agent. Fills CACHE_MOUNTS. The dir must exist in the image owned by `agent`
+# (docker/Dockerfile pre-creates the common ones), so a fresh volume is writable.
+cache_mounts() {
+  local id=$1 dir slug dirs=()
+  CACHE_MOUNTS=()
+  read -ra dirs <<<"$2"
+  for dir in "${dirs[@]}"; do
+    [[ "$dir" =~ $CACHE_DIR_RE && "$dir/" != */./* && "$dir/" != */../* ]] \
+      || die "invalid CACHE_DIRS entry: $dir (must be a path under /home/agent)"
+    slug=${dir#/home/agent/}
+    slug=${slug//\//-}
+    CACHE_MOUNTS+=(-v "agent-cache-$id-$slug:$dir")
+  done
+}
+
+# secret_masks <repo>: -v /dev/null over every .env in agents/<repo>/, so the read-only
+# mount never exposes a secrets file (to the model or to anything else in the container).
+secret_masks() {
+  local file
+  while IFS= read -r -d '' file; do
+    printf '%s\0' -v "/dev/null:$CONTAINER_HOME/agents/${file#"$AGENTS_DIR"/}:ro"
+  done < <(find "$AGENTS_DIR/$1" -name '.env*' ! -name '*.example' -print0)
+}
+
+# run_container <id> <repo> <agent> <claude token> <agent secrets>
+# All secrets go in on stdin (-i), first line the Claude token: run-agent.sh reads them into
+# shell variables and passes the token only to claude and the agent secrets only to pre.sh/post.sh.
+run_container() {
+  local id=$1 extra=() masks=()
+  # Per-repo extra firewall domains, read by init-firewall.sh from the read-only agents mount.
+  if [[ -f "$AGENTS_DIR/$2/allowlist.txt" ]]; then
+    extra=(-e "EXTRA_ALLOWLIST=$CONTAINER_HOME/agents/$2/allowlist.txt")
+  fi
+  mapfile -d '' masks < <(secret_masks "$2")
+  printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n%s' "$4" "${5:+$5$'\n'}" |
+  docker run --rm --init -i \
+    --name "agent-$id" \
+    --cap-drop=ALL \
+    --cap-add=NET_ADMIN --cap-add=NET_RAW \
+    --cap-add=SETUID --cap-add=SETGID --cap-add=SETPCAP \
+    --security-opt=no-new-privileges \
+    --memory="${AGENT_MEMORY:-6g}" --cpus="${AGENT_CPUS:-2}" --pids-limit=2048 \
+    "${extra[@]}" \
+    -v "$ROOT/runner:$CONTAINER_HOME/runner:ro" \
+    -v "$AGENTS_DIR/$2:$CONTAINER_HOME/agents/$2:ro" "${masks[@]}" \
+    -v "$LOGS_DIR:/logs" \
+    "${CACHE_MOUNTS[@]}" \
+    "$IMAGE" bash "$CONTAINER_HOME/runner/run-agent.sh" "$2" "$3"
+}
+
+main "$@"

@@ -1,0 +1,13 @@
+# Extra outbound domains for this repo's agents (HTTPS only, one per line).
+# The base list (docker/allowlist.txt) only has the Claude API; everything else is blocked.
+# Keep this minimal: every domain is somewhere the agent could send code to.
+
+# Where pre.sh clones from (listing github.com also adds GitHub's published IP ranges).
+github.com
+
+# Add what your hooks or tests need, for example:
+# api.github.com              # if post.sh calls the GitHub API
+# registry.npmjs.org          # npm
+# pypi.org                    # pip (both lines)
+# files.pythonhosted.org
+# repo.maven.apache.org       # Maven / Gradle

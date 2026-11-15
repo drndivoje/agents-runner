@@ -1,0 +1,9 @@
+# Outbound domains the agent container may reach (HTTPS only, IPv4).
+# Everything else is rejected by init-firewall.sh. One domain per line.
+# Extend only if strictly needed — see CLAUDE.md "Security rules".
+# Only what Claude Code itself needs. Everything else (GitHub, package registries, …)
+# goes into agents/<repo>/allowlist.txt for the repos that need it.
+
+# Claude API
+api.anthropic.com
+

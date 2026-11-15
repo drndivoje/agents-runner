@@ -1,0 +1,23 @@
+# Secrets — never commit. Everything in secrets/ is ignored except the example;
+# agent secrets live in agents/<repo>/<agent>/.env (bin/agent checks they're ignored).
+secrets/*
+!secrets/.env.example
+.env
+.env.*
+!.env.example
+*.env.local
+
+# Your own agent configs stay local; only the template is committed.
+agents/*
+!agents/example/
+
+# Personal Claude Code settings for working on this repo
+.claude/settings.json
+.claude/settings.local.json
+CLAUDE.local.md
+
+# Agent run logs (transcripts may contain code and issue text)
+logs/
+
+# Per-agent flock files
+.locks/
