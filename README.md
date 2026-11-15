@@ -5,11 +5,7 @@ Run Claude Code agents on a schedule against your own repositories, on your
 machine: a script prepares the task, Claude Code works on the code headless (`claude -p`),
 and a script takes the result and does something with it.
 
-What an agent does is up to you. The author uses two agents on
-[whereisivan](https://github.com/drndivoje/whereisivan): one reads the code at night and
-opens a GitHub issue, the other picks up an issue and opens a draft pull request.
-
-It's a small personal tool: Bash, Docker and cron. No server, no database, no UI.
+What an agent does is up to you. It relies on the Claude defined agents inside the repository. It's a small personal tool. Bash, Docker and cron. No server, no database, no UI.
 
 ## How it works
 
@@ -55,12 +51,11 @@ Details: [docs/reference.md](docs/reference.md#writing-an-agent).
 
 ## What to expect
 
-- Every result goes through your post.sh: nothing reaches GitHub or anywhere else unless
-  your script sends it. For code changes, open draft pull requests and review them.
+- Every result goes through your post.sh: nothing reaches anything or anywhere else unless your script sends it.
 - Runs use your Claude subscription quota, so schedule them at night.
   `logs/stats.csv` shows tokens and time per run.
 - Quality depends mostly on the target repo: a good `CLAUDE.md` and a good agent definition.
-- POC limits: Claude Code only, Linux only.
+- PCurrently supports: Claude Code only, Linux only (not tested on MacOS nor Windows).
 
 ## Security
 
@@ -78,9 +73,7 @@ Details: [Secrets never reach the model](docs/reference.md#secrets-never-reach-t
 
 **Your machine:** Linux (x86_64), Docker usable without `sudo`, `bash`, `git`, `flock`,
 a Claude Pro or Max subscription, and the Claude Code CLI (once, to create a token).
-About 6 GB RAM and 2 CPUs per running agent. Never set `ANTHROPIC_API_KEY`: it switches
-billing to the paid API.
-
+About 6 GB RAM and 2 CPUs per running agent. No need to set `ANTHROPIC_API_KEY`: it uses Claude Code CLI in headless mode.
 ### Prerequisites: the target repository
 
 Pushed to the default branch:
